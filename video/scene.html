@@ -1,0 +1,450 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+<script type="importmap">{"imports":{"three":"/node_modules/three/build/three.module.js"}}</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+
+// ---------- Rahmendaten (aus der Referenz gemessen) ----------
+const W = 1080, H = 1920, FPS = 30, DURATION = 12.445;
+// Harte Schnitte der Referenz in Sekunden
+const CUTS = [0, 1.368, 3.52, 5.922, 8.09, 11.56, DURATION];
+
+// Eigener Text, Wort für Wort pro Szene (Wörter dürfen wie im Original über Schnitte laufen)
+const LINES = [
+  'Wenn die Turmuhr dreizehnmal schlägt,',
+  'wird es in dieser Stadt ganz still.',
+  'Und leuchtet ein Kreis unter deinen Füßen,',
+  'bist du jetzt an der Reihe.',
+  'Jeden Abend wandert das Licht zu jemand Neuem.',
+  'Wer es trägt, hat bis Mitternacht.'
+];
+// Startzeiten der Sätze (leicht versetzt zu den Schnitten wie bei gesprochener Sprache)
+const LINE_START = [0.0, 1.30, 3.45, 5.85, 8.02, 11.50];
+const LINE_END   = [1.30, 3.45, 5.85, 8.02, 11.50, DURATION];
+const WORDS = [];
+LINES.forEach((line, i) => {
+  const ws = line.split(' ');
+  const weights = ws.map(w => 0.35 + w.replace(/[^\p{L}]/gu, '').length * 0.11);
+  const total = weights.reduce((a, b) => a + b, 0);
+  let t = LINE_START[i];
+  ws.forEach((w, k) => {
+    const d = (LINE_END[i] - LINE_START[i]) * weights[k] / total;
+    WORDS.push({ text: w.replace(/[.,]/g, ''), start: t, end: t + d });
+    t += d;
+  });
+});
+
+// ---------- Renderer ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H);
+renderer.setPixelRatio(1);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+
+const out = document.createElement('canvas');
+out.width = W; out.height = H;
+document.body.appendChild(out);
+const ctx = out.getContext('2d');
+
+const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 500);
+
+// ---------- Helfer ----------
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+const clamp01 = t => Math.min(1, Math.max(0, t));
+let seed = 7;
+const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+
+function canvasTex(w, h, draw, repeatX = 1, repeatY = 1) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(repeatX, repeatY);
+  t.anisotropy = 8;
+  return t;
+}
+function mat(color, opts = {}) {
+  return new THREE.MeshStandardMaterial({ color, roughness: 0.85, metalness: 0, ...opts });
+}
+function box(w, h, d, material, x = 0, y = 0, z = 0, parent) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), typeof material === 'number' ? mat(material) : material);
+  m.position.set(x, y, z);
+  m.castShadow = true; m.receiveShadow = true;
+  if (parent) parent.add(m);
+  return m;
+}
+
+// ---------- Texturen ----------
+const brickTex = canvasTex(512, 512, (g, w, h) => {
+  g.fillStyle = '#5a2c22'; g.fillRect(0, 0, w, h);
+  const bh = 32, bw = 96;
+  for (let r = 0; r < h / bh; r++) {
+    for (let c = -1; c < w / bw + 1; c++) {
+      const x = c * bw + (r % 2 ? bw / 2 : 0);
+      const v = 0.8 + rnd() * 0.3;
+      g.fillStyle = `rgb(${130 * v | 0},${58 * v | 0},${42 * v | 0})`;
+      g.fillRect(x + 3, r * bh + 3, bw - 6, bh - 6);
+    }
+  }
+}, 3, 3);
+
+const asphaltTex = canvasTex(256, 256, (g, w, h) => {
+  g.fillStyle = '#6d7480'; g.fillRect(0, 0, w, h);
+  for (let i = 0; i < 4000; i++) { const v = 95 + rnd() * 40; g.fillStyle = `rgba(${v},${v + 4},${v + 12},0.5)`; g.fillRect(rnd() * w, rnd() * h, 2, 2); }
+}, 4, 40);
+
+const sidewalkTex = canvasTex(256, 256, (g, w, h) => {
+  g.fillStyle = '#b9bcc4'; g.fillRect(0, 0, w, h);
+  g.strokeStyle = '#a2a6af'; g.lineWidth = 3;
+  for (let i = 0; i <= 4; i++) { g.beginPath(); g.moveTo(0, i * 64); g.lineTo(w, i * 64); g.stroke(); }
+}, 1, 60);
+
+const cobbleTex = canvasTex(512, 512, (g, w, h) => {
+  g.fillStyle = '#4a2a1c'; g.fillRect(0, 0, w, h);
+  for (let y = 0; y < h; y += 28) for (let x = (y / 28) % 2 ? -18 : 0; x < w; x += 38) {
+    const v = 0.75 + rnd() * 0.4;
+    g.fillStyle = `rgb(${150 * v | 0},${86 * v | 0},${58 * v | 0})`;
+    g.beginPath(); g.ellipse(x + 18 + rnd() * 3, y + 14, 16, 11, rnd() * 0.4, 0, Math.PI * 2); g.fill();
+  }
+}, 10, 10);
+
+function stripeTex(c1, c2) {
+  return canvasTex(256, 64, (g, w, h) => {
+    for (let i = 0; i < 8; i++) { g.fillStyle = i % 2 ? c1 : c2; g.fillRect(i * 32, 0, 32, h); }
+  }, 2, 1);
+}
+function gradientTex(stops) {
+  return canvasTex(8, 512, (g, w, h) => {
+    const gr = g.createLinearGradient(0, 0, 0, h);
+    stops.forEach(([p, c]) => gr.addColorStop(p, c));
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  });
+}
+const skyDay = gradientTex([[0, '#4f8fd8'], [0.55, '#9cc6ee'], [1, '#d6e8f7']]);
+const skySunset = gradientTex([[0, '#d9662a'], [0.5, '#f09a45'], [1, '#ffcf8a']]);
+
+// ---------- Figuren (eigenes Klötzchen-Design) ----------
+function makeLimb(w, h, d, material) {
+  const pivot = new THREE.Group();
+  box(w, h, d, material, 0, -h / 2, 0, pivot);
+  return pivot;
+}
+function makeCharacter({ shirt, pants, skin, hair, hairStyle, arms, pantsPattern }) {
+  const g = new THREE.Group();
+  const shirtM = mat(shirt), pantsM = pantsPattern ? new THREE.MeshStandardMaterial({ map: pantsPattern, roughness: 0.9 }) : mat(pants);
+  const skinM = mat(skin), armM = mat(arms ?? shirt);
+  const legL = makeLimb(0.95, 2, 0.95, pantsM); legL.position.set(-0.5, 2, 0); g.add(legL);
+  const legR = makeLimb(0.95, 2, 0.95, pantsM); legR.position.set(0.5, 2, 0); g.add(legR);
+  box(2, 2, 1, shirtM, 0, 3, 0, g);
+  const armL = makeLimb(0.95, 2, 0.95, armM); armL.position.set(-1.48, 4, 0); g.add(armL);
+  const armR = makeLimb(0.95, 2, 0.95, armM); armR.position.set(1.48, 4, 0); g.add(armR);
+  const head = new THREE.Group(); head.position.set(0, 4.05, 0); g.add(head);
+  box(1.15, 1.15, 1.15, skinM, 0, 0.6, 0, head);
+  // Gesicht
+  const eyeM = new THREE.MeshBasicMaterial({ color: 0x1b1b24 });
+  [-0.22, 0.22].forEach(x => { const e = new THREE.Mesh(new THREE.PlaneGeometry(0.14, 0.22), eyeM); e.position.set(x, 0.68, 0.58); head.add(e); });
+  const mouth = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.06), eyeM); mouth.position.set(0, 0.36, 0.58); head.add(mouth);
+  // Haare aus vielen kleinen Klötzen
+  const hairM = mat(hair, { roughness: 0.7 });
+  const s = { blond: 11, curly: 23, bun: 31 }[hairStyle];
+  seed = s;
+  if (hairStyle === 'bun') {
+    box(1.25, 0.45, 1.25, hairM, 0, 1.25, -0.05, head);
+    box(1.25, 0.7, 0.3, hairM, 0, 0.9, -0.55, head);
+    box(0.6, 0.55, 0.6, hairM, 0, 1.45, -0.45, head);
+  } else {
+    for (let i = 0; i < 70; i++) {
+      const a = rnd() * Math.PI * 2, r = rnd() * 0.7;
+      const x = Math.cos(a) * r, z = Math.sin(a) * r - 0.05;
+      const sz = hairStyle === 'curly' ? 0.28 + rnd() * 0.18 : 0.18 + rnd() * 0.16;
+      const hgt = hairStyle === 'curly' ? sz : 0.3 + rnd() * 0.45;
+      const b = box(sz, hgt, sz, hairM, x, 1.22 + rnd() * 0.18, z, head);
+      if (hairStyle === 'blond') b.rotation.set((rnd() - 0.5) * 0.9, rnd() * 3, (rnd() - 0.5) * 0.9);
+    }
+    box(1.22, 1.2, 0.3, hairM, 0, 0.62, -0.5, head);
+    box(0.25, 0.7, 1.1, hairM, -0.56, 0.95, -0.05, head);
+    box(0.25, 0.7, 1.1, hairM, 0.56, 0.95, -0.05, head);
+    // Pony / Seiten
+    for (let i = 0; i < 26; i++) {
+      const side = rnd() < 0.5 ? -1 : 1, front = rnd() < 0.45;
+      const x = front ? (rnd() - 0.5) * 1.1 : side * 0.6;
+      const z = front ? 0.6 : (rnd() - 0.6) * 1.1;
+      box(0.2 + rnd() * 0.1, 0.35 + rnd() * 0.3, 0.2, hairM, x, 1.0 + rnd() * 0.15, z, head);
+    }
+  }
+  g.userData = { legL, legR, armL, armR, head };
+  return g;
+}
+function walkPose(ch, phase, amount = 1) {
+  const s = Math.sin(phase) * 0.6 * amount;
+  ch.userData.legL.rotation.x = s; ch.userData.legR.rotation.x = -s;
+  ch.userData.armL.rotation.x = -s * 0.9; ch.userData.armR.rotation.x = s * 0.9;
+}
+
+const hoodie = { shirt: 0x161a24, pants: 0x14161d, skin: 0xf1c79f, hair: 0xe8c27e, hairStyle: 'blond' };
+const ginger = { shirt: 0x15151a, pants: 0x1a1a20, skin: 0xf09a55, arms: 0xf09a55, hair: 0xb8471c, hairStyle: 'curly' };
+const flowerPants = canvasTex(64, 64, (g, w, h) => {
+  g.fillStyle = '#7a3a2a'; g.fillRect(0, 0, w, h);
+  for (let i = 0; i < 40; i++) { g.fillStyle = ['#d8a25e', '#3f1c18', '#e86c3a'][i % 3]; g.beginPath(); g.arc(rnd() * w, rnd() * h, 3 + rnd() * 3, 0, 7); g.fill(); }
+}, 1, 2);
+const granny = { shirt: 0xf09a55, pants: 0x7a3a2a, skin: 0xf2c9a0, hair: 0xd8d2c8, hairStyle: 'bun', pantsPattern: flowerPants };
+
+// ---------- Glühender Kreis (Story-Element) ----------
+function makeGlowRing() {
+  const tex = canvasTex(256, 256, (g, w, h) => {
+    const gr = g.createRadialGradient(128, 128, 40, 128, 128, 128);
+    gr.addColorStop(0, 'rgba(120,230,255,0.0)');
+    gr.addColorStop(0.62, 'rgba(120,230,255,0.25)');
+    gr.addColorStop(0.8, 'rgba(210,250,255,1)');
+    gr.addColorStop(0.9, 'rgba(120,220,255,0.6)');
+    gr.addColorStop(1, 'rgba(120,220,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+  m.rotation.x = -Math.PI / 2;
+  return m;
+}
+
+// ================= Welt 1: Turmuhr =================
+const clockWorld = new THREE.Scene();
+clockWorld.background = new THREE.Color(0x3a1a14);
+{
+  const wall = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshStandardMaterial({ map: brickTex, roughness: 0.95 }));
+  wall.receiveShadow = true; clockWorld.add(wall);
+  const face = new THREE.Mesh(new THREE.CylinderGeometry(5, 5, 0.3, 96), mat(0x6f8df0, { roughness: 0.6 }));
+  face.rotation.x = Math.PI / 2; face.position.z = 0.35; face.castShadow = true; face.receiveShadow = true; clockWorld.add(face);
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(5.1, 0.32, 16, 96), mat(0x0d0d10, { roughness: 0.5 }));
+  rim.position.z = 0.55; rim.castShadow = true; clockWorld.add(rim);
+  for (let i = 0; i < 12; i++) {
+    const a = i / 12 * Math.PI * 2, big = i % 3 === 0;
+    const t = box(big ? 0.28 : 0.42, big ? 1.0 : 0.62, 0.08, 0x0d0d10, Math.sin(a) * (big ? 4.05 : 4.2), Math.cos(a) * (big ? 4.05 : 4.2), 0.55, clockWorld);
+    t.rotation.z = -a;
+  }
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 0.2, 24), mat(0x0d0d10));
+  hub.rotation.x = Math.PI / 2; hub.position.z = 0.7; clockWorld.add(hub);
+  const hourHand = new THREE.Group(); hourHand.position.z = 0.62; clockWorld.add(hourHand);
+  box(0.36, 2.7, 0.08, 0x0d0d10, 0, 1.2, 0, hourHand);
+  const minHand = new THREE.Group(); minHand.position.z = 0.7; clockWorld.add(minHand);
+  box(0.26, 3.7, 0.08, 0x0d0d10, 0, 1.7, 0, minHand);
+  clockWorld.userData = { hourHand, minHand };
+  clockWorld.add(new THREE.AmbientLight(0xffffff, 0.9));
+  const sun = new THREE.DirectionalLight(0xfff1e0, 1.6); sun.position.set(-8, 10, 14); sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048); Object.assign(sun.shadow.camera, { left: -12, right: 12, top: 12, bottom: -12 });
+  clockWorld.add(sun);
+}
+
+// ================= Welt 2: Straße bei Tag =================
+const street = new THREE.Scene();
+street.background = skyDay;
+street.fog = new THREE.Fog(0xc7def2, 60, 190);
+{
+  const road = new THREE.Mesh(new THREE.PlaneGeometry(14, 400), new THREE.MeshStandardMaterial({ map: asphaltTex, roughness: 0.95 }));
+  road.rotation.x = -Math.PI / 2; road.position.z = -150; road.receiveShadow = true; street.add(road);
+  for (let z = 30; z > -340; z -= 7) {
+    const d = new THREE.Mesh(new THREE.PlaneGeometry(0.35, 3.2), mat(0xf2c63a, { roughness: 0.6 }));
+    d.rotation.x = -Math.PI / 2; d.position.set(0, 0.02, z); d.receiveShadow = true; street.add(d);
+  }
+  [-1, 1].forEach(side => {
+    const sw = new THREE.Mesh(new THREE.BoxGeometry(5, 0.3, 400), new THREE.MeshStandardMaterial({ map: sidewalkTex, roughness: 0.9 }));
+    sw.position.set(side * 9.5, 0.15, -150); sw.receiveShadow = true; street.add(sw);
+    const grass = new THREE.Mesh(new THREE.PlaneGeometry(60, 400), mat(0x6fae4b));
+    grass.rotation.x = -Math.PI / 2; grass.position.set(side * 42, 0.05, -150); grass.receiveShadow = true; street.add(grass);
+    seed = side > 0 ? 99 : 51;
+    for (let z = 20; z > -300; z -= 16) {
+      // Haus
+      const hx = side * (16.8 + rnd() * 1.2), wallC = [0xf4efe6, 0xfbf6ea, 0xe9e2d4][Math.floor(rnd() * 3)];
+      const hw = 9, hh = 6 + rnd() * 3, hd = 10;
+      box(hw, hh, hd, wallC, hx, hh / 2 + 0.3, z, street);
+      const roof = new THREE.Mesh(new THREE.ConeGeometry(7.6, 5, 4), mat([0xc8392b, 0xb33a2c, 0xd2523a][Math.floor(rnd() * 3)]));
+      roof.rotation.y = Math.PI / 4; roof.scale.z = 1.1; roof.position.set(hx, hh + 2.8, z); roof.castShadow = true; street.add(roof);
+      for (let k = -1; k <= 1; k += 2) box(1.6, 1.8, 0.1, 0x2e3a4a, hx - side * (hw / 2 + 0.01), hh * 0.62, z + k * 2.5, street).rotation.y = Math.PI / 2;
+      box(0.2, 2.6, 1.6, 0x7a4b2a, hx - side * (hw / 2 + 0.05), 1.6, z, street);
+      // Bäume
+      const tz = z - 8;
+      box(0.6, 4, 0.6, 0x6b4a2e, side * 11, 2, tz, street);
+      for (let k = 0; k < 3; k++) {
+        const crown = new THREE.Mesh(new THREE.IcosahedronGeometry(2 + rnd() * 0.8, 0), mat([0x4f9a3a, 0x5fae45, 0x3f8a32][k], { flatShading: true }));
+        crown.position.set(side * 11 + (rnd() - 0.5) * 1.6, 5 + k * 0.9, tz + (rnd() - 0.5) * 1.6); crown.castShadow = true; street.add(crown);
+      }
+      // Laternen
+      box(0.3, 6, 0.3, 0x15171c, side * 7.6, 3.3, z - 3, street);
+      box(0.8, 0.5, 0.8, 0x15171c, side * 7.6, 6.4, z - 3, street);
+      box(0.6, 0.3, 0.6, 0xfff3c8, side * 7.6, 6.05, z - 3, street);
+      // Passanten in der Ferne
+      if (z < -10 && rnd() < 0.55) {
+        const p = makeCharacter({ shirt: [0x2d5fa8, 0x8a2b2b, 0x2a2a2a, 0xe0e0e0][Math.floor(rnd() * 4)], pants: 0x222831, skin: 0xf1c79f, hair: [0x2a1a10, 0xe8c27e, 0x111111][Math.floor(rnd() * 3)], hairStyle: 'curly' });
+        p.scale.setScalar(0.38); p.position.set(side * (8.5 + rnd() * 2), 0.3, z - 6); p.rotation.y = rnd() * Math.PI * 2; street.add(p);
+      }
+      // Briefkasten / Bank
+      if (rnd() < 0.4) box(0.7, 1.2, 0.5, 0x2a54c8, side * 11.6, 0.9, z + 4, street);
+    }
+  });
+  street.add(new THREE.HemisphereLight(0xcfe6ff, 0x6a7a55, 1.1));
+  const sun = new THREE.DirectionalLight(0xfff4e2, 2.4);
+  sun.position.set(6, 9, 62); sun.castShadow = true; sun.shadow.mapSize.set(4096, 4096);
+  Object.assign(sun.shadow.camera, { left: -45, right: 45, top: 45, bottom: -45, near: 1, far: 220 });
+  sun.shadow.bias = -0.0004;
+  street.add(sun); street.add(sun.target); sun.target.position.set(0, 0, -10);
+  street.userData.sun = sun;
+}
+// Figur, deren langer Schatten in Szene 2 auf der Straße liegt (selbst nicht im Bild)
+const shadowCaster = makeCharacter(hoodie);
+shadowCaster.position.set(-3.2, 0, 16); street.add(shadowCaster);
+// Hauptfigur für Szenen 3 und 4
+const hero = makeCharacter(hoodie);
+hero.position.set(-3.5, 0, -40); street.add(hero);
+const heroRing = makeGlowRing(); heroRing.position.set(-3.5, 0.06, -40); street.add(heroRing);
+
+// ================= Welt 3: Platz bei Sonnenuntergang =================
+const plaza = new THREE.Scene();
+plaza.background = skySunset;
+plaza.fog = new THREE.Fog(0xf0a05a, 40, 120);
+{
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), new THREE.MeshStandardMaterial({ map: cobbleTex, roughness: 0.95 }));
+  ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; plaza.add(ground);
+  // Ladenzeile
+  const shops = [[0xe9a05e, 'blue'], [0xd98d4f, 'green'], [0xeaa866, 'blue'], [0xdc9455, 'green']];
+  shops.forEach(([c, aw], i) => {
+    const x = -27 + i * 18;
+    box(18, 14, 4, c, x, 7, -22, plaza);
+    box(8, 4.5, 0.2, 0x2a2420, x - 3, 4, -19.9, plaza);
+    box(3, 5.5, 0.2, 0x3a2a20, x + 5, 2.75, -19.9, plaza);
+    box(8, 2.6, 0.2, 0x2a2420, x - 3, 10.5, -19.9, plaza);
+    const awning = new THREE.Mesh(new THREE.BoxGeometry(12, 0.2, 3), new THREE.MeshStandardMaterial({ map: aw === 'blue' ? stripeTex('#1f3f7a', '#e8eef7') : stripeTex('#1f6a45', '#e8eef7'), roughness: 0.8 }));
+    awning.position.set(x - 1, 7.2, -18.6); awning.rotation.x = 0.35; awning.castShadow = true; plaza.add(awning);
+    box(18.4, 0.6, 4.4, 0xb36a35, x, 14.2, -22, plaza);
+  });
+  // Bänke
+  [[-6, -15], [9, -15]].forEach(([x, z]) => {
+    box(5, 0.35, 1.4, 0x6b3d22, x, 1.5, z, plaza);
+    box(5, 1.2, 0.3, 0x6b3d22, x, 2.4, z - 0.6, plaza);
+    box(0.3, 1.5, 1.2, 0x2a1c14, x - 2.2, 0.75, z, plaza);
+    box(0.3, 1.5, 1.2, 0x2a1c14, x + 2.2, 0.75, z, plaza);
+  });
+  // Blumenbeet
+  box(7, 0.6, 4, 0x2a1a14, -2, 0.3, -9, plaza);
+  seed = 5;
+  for (let i = 0; i < 26; i++) box(0.35, 0.35, 0.35, [0xe23b2e, 0xf2c63a, 0xf07a2a, 0x6fbf4a][i % 4], -5 + rnd() * 6.4, 0.75, -10.6 + rnd() * 3.2, plaza);
+  // Brunnen
+  const basin = new THREE.Mesh(new THREE.CylinderGeometry(5, 5.3, 1.6, 48), mat(0x7a5a48));
+  basin.position.set(13, 0.8, -4); basin.castShadow = true; basin.receiveShadow = true; plaza.add(basin);
+  const water = new THREE.Mesh(new THREE.CylinderGeometry(4.5, 4.5, 0.1, 48), mat(0x3d7fb0, { roughness: 0.2 }));
+  water.position.set(13, 1.5, -4); plaza.add(water);
+  box(1, 3, 1, 0x7a5a48, 13, 2.5, -4, plaza);
+  // Laternen
+  [[-14, -12], [4, -13], [20, -12]].forEach(([x, z]) => { box(0.3, 8, 0.3, 0x15171c, x, 4, z, plaza); box(0.9, 0.7, 0.9, 0x15171c, x, 8.2, z, plaza); });
+  plaza.add(new THREE.HemisphereLight(0xffd2a8, 0x6a4030, 1.15));
+  const sun = new THREE.DirectionalLight(0xffa860, 2.8);
+  sun.position.set(-30, 18, 20); sun.castShadow = true; sun.shadow.mapSize.set(4096, 4096);
+  Object.assign(sun.shadow.camera, { left: -40, right: 40, top: 40, bottom: -40, near: 1, far: 120 });
+  sun.shadow.bias = -0.0004;
+  plaza.add(sun);
+}
+const walker = makeCharacter(ginger); plaza.add(walker);
+const walkerRing = makeGlowRing(); plaza.add(walkerRing);
+const bystander = makeCharacter(hoodie); bystander.position.set(9, 0, 3); bystander.rotation.y = -2.4; plaza.add(bystander);
+const grandma = makeCharacter(granny); plaza.add(grandma);
+
+// ---------- Untertitel (weiß, fett, schwarzer Rand – wie in der Referenz) ----------
+function drawCaption(t) {
+  const w = WORDS.find(w => t >= w.start && t < w.end) || (t >= DURATION - 0.001 ? WORDS[WORDS.length - 1] : null);
+  if (!w) return;
+  let size = 150;
+  ctx.font = `800 ${size}px "Inter", "DejaVu Sans", sans-serif`;
+  const maxW = W * 0.86;
+  const mw = ctx.measureText(w.text).width;
+  if (mw > maxW) { size = Math.floor(size * maxW / mw); ctx.font = `800 ${size}px "Inter", "DejaVu Sans", sans-serif`; }
+  const x = W / 2, y = H * 0.625;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = 'rgba(0,0,0,0.45)'; ctx.shadowBlur = 10; ctx.shadowOffsetY = 4;
+  ctx.strokeStyle = '#000'; ctx.lineWidth = size * 0.16; ctx.strokeText(w.text, x, y);
+  ctx.shadowColor = 'transparent';
+  ctx.fillStyle = '#fff'; ctx.fillText(w.text, x, y);
+}
+
+// ---------- Szenen-Logik ----------
+function setCam(px, py, pz, lx, ly, lz, fov = 50) {
+  camera.fov = fov; camera.updateProjectionMatrix();
+  camera.position.set(px, py, pz); camera.lookAt(lx, ly, lz);
+}
+function renderAt(t) {
+  let sc = 0; while (sc < CUTS.length - 2 && t >= CUTS[sc + 1]) sc++;
+  const p = clamp01((t - CUTS[sc]) / (CUTS[sc + 1] - CUTS[sc]));
+  const e = ease(p);
+  let world;
+  shadowCaster.visible = sc === 1;
+  hero.visible = sc === 2 || sc === 3;
+  heroRing.visible = hero.visible;
+
+  if (sc === 0) {
+    // 1) Uhr: kräftige Fahrt auf das Zifferblatt, Stundenzeiger rückt auf 12
+    world = clockWorld;
+    clockWorld.userData.hourHand.rotation.z = lerp(0.07, 0, ease(clamp01(p * 1.4)));
+    clockWorld.userData.minHand.rotation.z = lerp(0.02, 0, ease(clamp01(p * 1.4)));
+    setCam(lerp(-0.4, 0.2, e), lerp(-1.4, 0.6, e), lerp(19, 9.2, e), lerp(-0.6, 0.15, e), lerp(-0.6, 1.0, e), 0, 50);
+  } else if (sc === 1) {
+    // 2) Straße: tiefe Kamera, ruhige Fahrt nach vorn, langer Schatten im Vordergrund
+    world = street;
+    walkPose(shadowCaster, 0, 0);
+    setCam(lerp(-1.6, -1.3, e), lerp(4.6, 4.2, e), lerp(13, 6.5, e), -0.5, 3.2, -80, 58);
+  } else if (sc === 2) {
+    // 3) Figur von schräg oben, Kopf senkt sich, Kreis erscheint unter den Füßen
+    world = street;
+    walkPose(hero, 0, 0);
+    hero.rotation.y = 0;
+    hero.userData.head.rotation.x = lerp(0, 0.55, ease(clamp01((p - 0.25) / 0.45)));
+    const r = ease(clamp01((p - 0.3) / 0.6));
+    heroRing.scale.setScalar(lerp(0.5, 6.4, r)); heroRing.material.opacity = r;
+    const hx = hero.position.x, hz = hero.position.z;
+    setCam(hx + lerp(0.3, 0, e), lerp(7.0, 8.6, e), hz + lerp(6.2, 4.2, e), hx, lerp(3.6, 1.2, e), hz, 50);
+  } else if (sc === 3) {
+    // 4) Über die Schulter: Blick die Straße hinunter, langsame Fahrt
+    world = street;
+    walkPose(hero, 0, 0);
+    hero.userData.head.rotation.x = lerp(0.55, 0.25, ease(clamp01(p * 2)));
+    hero.rotation.y = Math.PI;
+    heroRing.scale.setScalar(6.4); heroRing.material.opacity = 1;
+    const hx = hero.position.x, hz = hero.position.z;
+    setCam(hx + lerp(0.6, 0.4, e), lerp(6.6, 6.3, e), hz + lerp(8.5, 6.8, e), hx + 1.0, 3.0, hz - 60, 55);
+  } else if (sc === 4) {
+    // 5) Sonnenuntergang: Figur geht über den Platz, Kamera folgt von hinten
+    world = plaza;
+    const z = lerp(4, -3.5, p);
+    walker.position.set(-1, 0, z); walker.rotation.y = Math.PI;
+    walkPose(walker, t * 7.5);
+    walkerRing.position.set(-1, 0.06, z); walkerRing.scale.setScalar(6.2); walkerRing.material.opacity = 1;
+    grandma.visible = false;
+    setCam(lerp(-0.2, -0.6, e), lerp(10.5, 8.6, e), z + lerp(15, 11, e), -1, 2.2, z - 8, 52);
+  } else {
+    // 6) Nah: Figur geht an einer zweiten Person vorbei, Licht wechselt den Besitzer
+    world = plaza;
+    grandma.visible = true;
+    grandma.position.set(-4.6, 0, -6); grandma.rotation.y = 0.5; walkPose(grandma, 0, 0);
+    const x = lerp(-2.4, 0.4, p);
+    walker.position.set(x, 0, -5.4); walker.rotation.y = Math.PI * 0.62;
+    walkPose(walker, t * 7.5);
+    walkerRing.position.set(lerp(x, -4.6, ease(p)), 0.06, lerp(-5.4, -6, ease(p))); walkerRing.scale.setScalar(6.2);
+    setCam(lerp(-1.4, -1.7, e), 4.6, lerp(5.6, 4.9, e), -2.2, 3.4, -6, 52);
+  }
+  renderer.render(world, camera);
+  ctx.drawImage(renderer.domElement, 0, 0);
+  drawCaption(t);
+}
+
+window.META = { W, H, FPS, DURATION, WORDS, CUTS };
+window.renderFrame = i => { renderAt(i / FPS); return out.toDataURL('image/jpeg', 0.95); };
+window.ready = true;
+</script>
+</body>
+</html>
